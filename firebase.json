@@ -1,0 +1,52 @@
+{
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "stocktracker-f8f91",
+          "appId": "1:690501444152:android:07e6cd21fa836e42dabccd",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "stocktracker-f8f91",
+          "configurations": {
+            "android": "1:690501444152:android:07e6cd21fa836e42dabccd",
+            "web": "1:690501444152:web:eff4774e8f1385fedabccd",
+            "windows": "1:690501444152:web:d5a2a66fc421f47edabccd"
+          }
+        }
+      }
+    }
+  },
+  "firestore": {
+    "indexes": "firestore.indexes.json",
+    "rules": "firestore.rules"
+  },
+  "functions": [
+    {
+      "ignore": [
+        "node_modules",
+        "test",
+        "bootstrap-admin.js",
+        "*.log",
+        "backfill-reports.js"
+      ],
+      "source": "functions",
+      "codebase": "stockflow"
+    }
+  ],
+  "emulators": {
+    "firestore": {
+      "port": 8180
+    },
+    "ui": {
+      "enabled": false
+    },
+    "singleProjectMode": true,
+    "auth": {
+      "port": 9099
+    }
+  }
+}

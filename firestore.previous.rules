@@ -1,0 +1,152 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function me() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function active() { return signedIn() && me().isActive == true && me().role in ['admin', 'staff']; }
+    function admin() { return active() && me().role == 'admin'; }
+    function actor(d) {
+      return d.lastUpdatedByUid == request.auth.uid && d.lastUpdatedByName == me().name
+        && d.lastUpdatedByEmail == me().email && d.lastUpdatedAt == request.time;
+    }
+    function validUser(d, uid) {
+      return d.keys().hasOnly(['uid','name','email','phone','role','branch','isActive','createdAt','lastLogin'])
+        && d.uid == uid && d.name is string && d.name.size() > 0 && d.email is string
+        && d.phone is string && d.branch is string && d.role in ['admin','staff']
+        && d.isActive is bool && d.createdAt is timestamp && (d.lastLogin == null || d.lastLogin is timestamp);
+    }
+    match /users/{uid} {
+      allow get: if signedIn() && (request.auth.uid == uid || admin());
+      allow list: if admin();
+      allow create: if admin() && uid != request.auth.uid && validUser(request.resource.data,uid)
+        && request.resource.data.createdAt == request.time && request.resource.data.lastLogin == null;
+      allow update: if admin() && validUser(request.resource.data,uid)
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.lastLogin == resource.data.lastLogin
+        && (uid != request.auth.uid || (request.resource.data.role == resource.data.role
+          && request.resource.data.isActive == resource.data.isActive));
+      allow delete: if false;
+    }
+    match /account_requests/{email} {
+      allow read: if admin();
+      allow create, update: if admin() && request.resource.data.keys().hasOnly(['email','requestedByUid','role','createdAt','expiresAt'])
+        && request.resource.data.email == email && email == email.lower()
+        && request.resource.data.requestedByUid == request.auth.uid
+        && request.resource.data.role in ['admin','staff'] && request.resource.data.createdAt == request.time
+        && request.resource.data.expiresAt is timestamp && request.resource.data.expiresAt > request.time
+        && request.resource.data.expiresAt <= request.time + duration.value(6,'m');
+      allow delete: if admin();
+    }
+    function validProduct(d,id) {
+      return d.keys().hasOnly(['id','name','sku','category','description','imageUrl','purchasePrice','sellingPrice',
+        'addedQuantity','soldQuantity','remainingQuantity','lowStockLimit','addedDate','lastUpdatedAt',
+        'lastUpdatedByUid','lastUpdatedByName','lastUpdatedByEmail','lastUpdateId'])
+        && d.id == id && d.name is string && d.name.size() > 0 && d.sku is string && d.sku.size() > 0
+        && d.category is string && d.description is string && d.imageUrl is string
+        && d.purchasePrice is number && d.purchasePrice >= 0 && d.purchasePrice <= 1000000000
+        && d.sellingPrice is number && d.sellingPrice >= 0 && d.sellingPrice <= 1000000000
+        && d.addedQuantity is int && d.addedQuantity >= 0 && d.addedQuantity <= 1000000000
+        && d.soldQuantity is int && d.soldQuantity >= 0
+        && d.remainingQuantity is int && d.remainingQuantity >= 0
+        && d.remainingQuantity == d.addedQuantity - d.soldQuantity
+        && d.lowStockLimit is int && d.lowStockLimit >= 0
+        && d.addedDate is timestamp && d.lastUpdateId is string && actor(d);
+    }
+    function newLog(d,id) {
+      let path = /databases/$(database)/documents/stock_updates/$(d.lastUpdateId);
+      let log = getAfter(path).data;
+      return !exists(path) && log.productId == id && log.newQuantity == d.remainingQuantity
+        && log.updatedByUid == request.auth.uid;
+    }
+    match /products/{id} {
+      allow read: if active();
+      allow create: if admin() && validProduct(request.resource.data,id)
+        && request.resource.data.soldQuantity == 0 && request.resource.data.addedDate == request.time
+        && newLog(request.resource.data,id);
+      allow update: if active() && validProduct(request.resource.data,id)
+        && request.resource.data.addedDate == resource.data.addedDate
+        && request.resource.data.lastUpdateId != resource.data.lastUpdateId
+        && newLog(request.resource.data,id)
+        && (admin() || request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'addedQuantity','soldQuantity','remainingQuantity','lastUpdatedAt','lastUpdatedByUid',
+          'lastUpdatedByName','lastUpdatedByEmail','lastUpdateId']));
+      allow delete: if false;
+    }
+    function validBuyer(d,id) {
+      return d.keys().hasOnly(['id','name','phone','address','productId','productName','quantity','unitPrice','totalAmount',
+        'purchaseDate','warrantyStartDate','warrantyEndDate','notes','recordedByUid','recordedByName','createdAt'])
+        && d.id == id && d.name is string && d.name.size() > 0 && d.phone is string && d.phone.size() > 0
+        && d.address is string && d.notes is string && d.productId is string && d.productName is string
+        && d.quantity is int && d.quantity > 0 && d.unitPrice is number && d.unitPrice >= 0
+        && d.totalAmount == d.unitPrice*d.quantity
+        && d.purchaseDate is timestamp && d.warrantyStartDate is timestamp && d.warrantyEndDate is timestamp
+        && d.warrantyStartDate >= d.purchaseDate && d.warrantyEndDate >= d.warrantyStartDate
+        && d.recordedByUid == request.auth.uid && d.recordedByName == me().name && d.createdAt == request.time;
+    }
+    function saleMatches(d,id) {
+      let path = /databases/$(database)/documents/products/$(d.productId);
+      let before = get(path).data;
+      let after = getAfter(path).data;
+      let log = getAfter(/databases/$(database)/documents/stock_updates/$(id)).data;
+      return d.productName == before.name && d.unitPrice == before.sellingPrice
+        && after.remainingQuantity == before.remainingQuantity-d.quantity
+        && after.soldQuantity == before.soldQuantity+d.quantity
+        && after.addedQuantity == before.addedQuantity && after.lastUpdateId == id
+        && log.updateType == 'sale' && log.productId == d.productId && log.changedQuantity == -d.quantity;
+    }
+    match /buyers/{id} {
+      allow read: if active();
+      allow create: if active() && validBuyer(request.resource.data,id) && saleMatches(request.resource.data,id);
+      allow update, delete: if false;
+    }
+    function validLog(d,id) {
+      return d.keys().hasOnly(['id','productId','productName','previousQuantity','changedQuantity','newQuantity',
+        'updateType','note','updatedByUid','updatedByName','updatedByEmail','createdAt'])
+        && d.id == id && d.productId is string && d.productName is string && d.note is string
+        && d.previousQuantity is int && d.previousQuantity >= 0 && d.changedQuantity is int
+        && d.newQuantity is int && d.newQuantity >= 0 && d.newQuantity == d.previousQuantity+d.changedQuantity
+        && d.updatedByUid == request.auth.uid && d.updatedByName == me().name && d.updatedByEmail == me().email
+        && d.createdAt == request.time && d.updateType in ['initial','adjustment','sale'];
+    }
+    function logMatches(d,id) {
+      let path = /databases/$(database)/documents/products/$(d.productId);
+      let after = getAfter(path).data;
+      return after.lastUpdateId == id && after.name == d.productName && after.remainingQuantity == d.newQuantity
+        && ((d.updateType == 'initial' && admin() && !exists(path) && d.previousQuantity == 0 && after.soldQuantity == 0)
+          || (d.updateType != 'initial' && exists(path) && existingLogMatches(d,id,path,after)));
+    }
+    function existingLogMatches(d,id,path,after) {
+      let before = get(path).data;
+      return before.remainingQuantity == d.previousQuantity && before.lastUpdateId != id
+        && ((d.updateType == 'adjustment' && d.note.size() > 0
+              && after.soldQuantity == before.soldQuantity && after.addedQuantity == before.addedQuantity+d.changedQuantity)
+          || (d.updateType == 'sale' && d.changedQuantity < 0
+              && !exists(/databases/$(database)/documents/buyers/$(id))
+              && getAfter(/databases/$(database)/documents/buyers/$(id)).data.productId == d.productId
+              && getAfter(/databases/$(database)/documents/buyers/$(id)).data.quantity == -d.changedQuantity
+              && after.soldQuantity == before.soldQuantity-d.changedQuantity && after.addedQuantity == before.addedQuantity));
+    }
+    match /stock_updates/{id} {
+      allow read: if active() && (admin() || resource.data.updatedByUid == request.auth.uid);
+      allow create: if active() && validLog(request.resource.data,id) && logMatches(request.resource.data,id);
+      allow update, delete: if false;
+    }
+    match /notifications/{id} {
+      allow read: if active() && (admin() || resource.data.recipientUid == request.auth.uid);
+      allow create: if active() && request.resource.data.keys().hasOnly(['id','title','message','recipientUid','isRead','createdAt'])
+        && request.resource.data.id == id && request.resource.data.recipientUid == request.auth.uid
+        && request.resource.data.title is string && request.resource.data.message is string
+        && request.resource.data.isRead == false && request.resource.data.createdAt == request.time;
+      allow update: if active() && (admin() || resource.data.recipientUid == request.auth.uid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead']) && request.resource.data.isRead is bool;
+      allow delete: if admin();
+    }
+    match /reports/{document=**} {
+      allow read: if admin();
+      allow write: if false;
+    }
+    match /{document=**} { allow read, write: if false; }
+  }
+}

@@ -1,0 +1,285 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------
+    // Helper functions
+    // ---------------------------------------------------------
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function userPath() {
+      return /databases/$(database)/documents/users/$(request.auth.uid);
+    }
+
+    function userExists() {
+      return isSignedIn() && exists(userPath());
+    }
+
+    function currentUser() {
+      return get(userPath()).data;
+    }
+
+    function isActiveUser() {
+      return userExists() &&
+          currentUser().isActive == true;
+    }
+
+    function isAdmin() {
+      return isActiveUser() &&
+          currentUser().role == "admin";
+    }
+
+    function isStaff() {
+      return isActiveUser() &&
+          currentUser().role == "staff";
+    }
+
+    function isAdminOrStaff() {
+      return isAdmin() || isStaff();
+    }
+
+    function validRole(role) {
+      return role == "admin" || role == "staff";
+    }
+
+    function isNonNegativeNumber(value) {
+      return value is number && value >= 0;
+    }
+
+    // ---------------------------------------------------------
+    // Users
+    // ---------------------------------------------------------
+
+    match /users/{userId} {
+
+      // Users can read their own account.
+      // Admin can read every account.
+      allow get: if isAdmin() ||
+          (isActiveUser() && request.auth.uid == userId);
+
+      // Only admins can list all users.
+      allow list: if isAdmin();
+
+      // Only an authenticated admin can create staff/admin profiles.
+      allow create: if isAdmin()
+          && request.resource.data.uid == userId
+          && request.resource.data.uid is string
+          && request.resource.data.name is string
+          && request.resource.data.email is string
+          && request.resource.data.role is string
+          && validRole(request.resource.data.role)
+          && request.resource.data.isActive is bool
+          && request.resource.data.createdAt is timestamp;
+
+      // Admin has permission to update accounts.
+      allow update: if isAdmin()
+          && request.resource.data.uid == resource.data.uid
+          && validRole(request.resource.data.role);
+
+      // A user may update only safe profile fields.
+      allow update: if isActiveUser()
+          && request.auth.uid == userId
+          && request.resource.data
+              .diff(resource.data)
+              .affectedKeys()
+              .hasOnly([
+                "name",
+                "phone",
+                "branch",
+                "photoUrl",
+                "lastLogin"
+              ])
+          && request.resource.data.uid == resource.data.uid
+          && request.resource.data.role == resource.data.role
+          && request.resource.data.isActive == resource.data.isActive;
+
+      // User accounts should normally be disabled instead of deleted.
+      allow delete: if isAdmin();
+    }
+
+    // ---------------------------------------------------------
+    // Products and stock
+    // ---------------------------------------------------------
+
+    match /products/{productId} {
+
+      allow read: if isAdminOrStaff();
+
+      // Only admin can add completely new products.
+      allow create: if isAdmin()
+          && request.resource.data.id == productId
+          && request.resource.data.name is string
+          && request.resource.data.sku is string
+          && request.resource.data.category is string
+          && isNonNegativeNumber(
+              request.resource.data.addedQuantity
+          )
+          && isNonNegativeNumber(
+              request.resource.data.soldQuantity
+          )
+          && isNonNegativeNumber(
+              request.resource.data.remainingQuantity
+          )
+          && isNonNegativeNumber(
+              request.resource.data.sellingPrice
+          )
+          && request.resource.data.lastUpdatedByUid ==
+              request.auth.uid;
+
+      // Admin can update a product while keeping quantities valid.
+      allow update: if isAdmin()
+          && validProductQuantities();
+
+      // Staff can update stock-related fields only.
+      allow update: if isStaff()
+          && validProductQuantities()
+          && request.resource.data
+              .diff(resource.data)
+              .affectedKeys()
+              .hasOnly([
+                "addedQuantity",
+                "soldQuantity",
+                "remainingQuantity",
+                "lastUpdatedAt",
+                "lastUpdatedByUid",
+                "lastUpdatedByName",
+                "lastUpdatedByEmail"
+              ])
+          && request.resource.data.lastUpdatedByUid ==
+              request.auth.uid;
+
+      allow delete: if isAdmin();
+
+      function validProductQuantities() {
+        return isNonNegativeNumber(
+                request.resource.data.addedQuantity
+            )
+            && isNonNegativeNumber(
+                request.resource.data.soldQuantity
+            )
+            && isNonNegativeNumber(
+                request.resource.data.remainingQuantity
+            )
+            && request.resource.data.remainingQuantity <=
+                request.resource.data.addedQuantity;
+      }
+    }
+
+    // ---------------------------------------------------------
+    // Buyers and customer purchases
+    // ---------------------------------------------------------
+
+    match /buyers/{buyerId} {
+
+      allow read: if isAdminOrStaff();
+
+      allow create: if isAdminOrStaff()
+          && request.resource.data.id == buyerId
+          && request.resource.data.name is string
+          && request.resource.data.phone is string
+          && request.resource.data.productId is string
+          && request.resource.data.productName is string
+          && request.resource.data.quantity is int
+          && request.resource.data.quantity > 0
+          && isNonNegativeNumber(
+              request.resource.data.unitPrice
+          )
+          && isNonNegativeNumber(
+              request.resource.data.totalAmount
+          )
+          && request.resource.data.recordedByUid ==
+              request.auth.uid
+          && request.resource.data.createdAt is timestamp;
+
+      // Only admin can change or delete completed purchase records.
+      allow update, delete: if isAdmin();
+    }
+
+    // ---------------------------------------------------------
+    // Stock update history
+    // ---------------------------------------------------------
+
+    match /stock_updates/{updateId} {
+
+      allow read: if isAdmin() ||
+          (
+            isStaff() &&
+            resource.data.updatedByUid == request.auth.uid
+          );
+
+      allow create: if isAdminOrStaff()
+          && request.resource.data.id == updateId
+          && request.resource.data.productId is string
+          && request.resource.data.productName is string
+          && request.resource.data.previousQuantity is number
+          && request.resource.data.previousQuantity >= 0
+          && request.resource.data.changedQuantity is number
+          && request.resource.data.newQuantity is number
+          && request.resource.data.newQuantity >= 0
+          && request.resource.data.updateType in [
+            "stock_added",
+            "stock_removed",
+            "sale",
+            "correction"
+          ]
+          && request.resource.data.updatedByUid ==
+              request.auth.uid
+          && request.resource.data.createdAt is timestamp;
+
+      // History records must remain immutable.
+      allow update, delete: if false;
+    }
+
+    // ---------------------------------------------------------
+    // Notifications
+    // ---------------------------------------------------------
+
+    match /notifications/{notificationId} {
+
+      allow get: if isAdmin() ||
+          (
+            isActiveUser() &&
+            resource.data.recipientUid == request.auth.uid
+          );
+
+      allow list: if isAdmin() || isActiveUser();
+
+      // Admin can create notifications for any account.
+      allow create: if isAdmin();
+
+      // User may only mark their own notification as read.
+      allow update: if isActiveUser()
+          && resource.data.recipientUid == request.auth.uid
+          && request.resource.data
+              .diff(resource.data)
+              .affectedKeys()
+              .hasOnly(["isRead", "readAt"]);
+
+      allow delete: if isAdmin();
+    }
+
+    // ---------------------------------------------------------
+    // Protected financial reports
+    // ---------------------------------------------------------
+
+    match /financial_reports/{reportId} {
+      allow read, create, update, delete: if isAdmin();
+    }
+
+    match /daily_reports/{reportId} {
+      allow read, create, update, delete: if isAdmin();
+    }
+
+    // ---------------------------------------------------------
+    // Deny every collection not explicitly declared above
+    // ---------------------------------------------------------
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
